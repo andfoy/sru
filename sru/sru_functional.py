@@ -392,18 +392,19 @@ class SRUCell(nn.Module):
         # Pytorch Function() doesn't accept NoneType in forward() call.
         # So we put mask_pad as class attribute as a work around
         SRU_Compute_Class = _lazy_load_cuda_kernel() if input.is_cuda else SRU_CPU_class
-        SRU_Compute = SRU_Compute_Class(
-            self.activation_type, n_out, self.bidirectional, self.has_skip_term,
-            scale_val, mask_pad
-        )
+        SRU_Compute = SRU_Compute_Class()
 
         # compute dropout mask for states c[]
         if self.training and (self.dropout > 0):
             bidir = 2 if self.bidirectional else 1
             mask_c = self.get_dropout_mask_((batch, n_out*bidir), self.dropout)
-            h, c = SRU_Compute(u, input, self.weight_c, self.bias, c0, mask_c)
+            h, c = SRU_Compute(self.activation_type, n_out, self.bidirectional,
+                               self.has_skip_term, scale_val, mask_pad, u,
+                               input, self.weight_c, self.bias, c0, mask_c)
         else:
-            h, c = SRU_Compute(u, input, self.weight_c, self.bias, c0)
+            h, c = SRU_Compute(self.activation_type, n_out, self.bidirectional,
+                               self.has_skip_term, scale_val, mask_pad,
+                               u, input, self.weight_c, self.bias, c0)
 
         if return_proj:
             x_projected = x_projected.view(-1, batch, self.n_proj) if self.n_proj else input

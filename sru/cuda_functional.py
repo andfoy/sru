@@ -437,66 +437,85 @@ extern "C" {
 }
 """
 
+_SRU_PROG = Program(SRU_CODE, 'sru_prog.cu')  # for pynvrtc >= 9.0
+_SRU_PTX = _SRU_PROG.compile()
+_DEVICE2FUNC = {}
+
+
+def compile_functions():
+    global _DEVICE2FUNC
+    device = torch.cuda.current_device()
+    mod = function.Module()
+    mod.load(bytes(_SRU_PTX.encode()))
+    fwd_func = mod.get_function('sru_fwd')
+    bwd_func = mod.get_function('sru_bwd')
+    bifwd_func = mod.get_function('sru_bi_fwd')
+    bibwd_func = mod.get_function('sru_bi_bwd')
+
+    Stream = namedtuple('Stream', ['ptr'])
+    current_stream = Stream(ptr=torch.cuda.current_stream().cuda_stream)
+
+    _DEVICE2FUNC[device] = (
+        current_stream, fwd_func,
+        bifwd_func, bwd_func, bibwd_func
+    )
+    return current_stream, fwd_func, bifwd_func, bwd_func, bibwd_func
+
+
+def get_functions():
+    res = _DEVICE2FUNC.get(torch.cuda.current_device(), None)
+    return res if res else compile_functions()
+
 
 class SRU_Compute_GPU(Function):
 
     #_SRU_PROG = Program(SRU_CODE.encode('utf-8'), 'sru_prog.cu'.encode())  # for pynvrtc < 9.0
-    _SRU_PROG = Program(SRU_CODE, 'sru_prog.cu')  # for pynvrtc >= 9.0
-    _SRU_PTX = _SRU_PROG.compile()
-    _DEVICE2FUNC = {}
 
-    def __init__(self,
-                 activation_type,
-                 d_out,
-                 bidirectional=False,
-                 has_skip_term=True,
-                 scale_x=1,
-                 mask_pad=None):
+    # def __init__(self,
+    #              activation_type,
+    #              d_out,
+    #              bidirectional=False,
+    #              has_skip_term=True,
+    #              scale_x=1,
+    #              mask_pad=None):
 
-        super(SRU_Compute_GPU, self).__init__()
-        self.activation_type = activation_type
-        self.d_out = d_out
-        self.bidirectional = bidirectional
-        self.has_skip_term = has_skip_term
-        self.scale_x = scale_x
-        # ensure mask_pad is a byte tensor
-        mask_pad = mask_pad.byte() if mask_pad is not None else None
-        self.mask_pad = mask_pad
+    #     super(SRU_Compute_GPU, self).__init__()
+    #     self.activation_type = activation_type
+    #     self.d_out = d_out
+    #     self.bidirectional = bidirectional
+    #     self.has_skip_term = has_skip_term
+    #     self.scale_x = scale_x
+    #     # ensure mask_pad is a byte tensor
+    #     mask_pad = mask_pad.byte() if mask_pad is not None else None
+    #     self.mask_pad = mask_pad
 
-    def compile_functions(self):
-        device = torch.cuda.current_device()
-        mod = function.Module()
-        mod.load(bytes(self._SRU_PTX.encode()))
-        fwd_func = mod.get_function('sru_fwd')
-        bwd_func = mod.get_function('sru_bwd')
-        bifwd_func = mod.get_function('sru_bi_fwd')
-        bibwd_func = mod.get_function('sru_bi_bwd')
+    @staticmethod
+    def forward(ctx, activation_type,
+                d_out,
+                bidirectional,
+                has_skip_term,
+                scale_x,
+                mask_pad,
+                u, x, weight_c, bias,
+                init=None, mask_c=None):
+        ctx.bidirectional = bidirectional
+        ctx.d_out = d_out
+        ctx.mask_pad = mask_pad
+        ctx.has_skip_term = has_skip_term
+        ctx.scale_x = scale_x
+        ctx.activation_type = activation_type
 
-        Stream = namedtuple('Stream', ['ptr'])
-        current_stream = Stream(ptr=torch.cuda.current_stream().cuda_stream)
-
-        self._DEVICE2FUNC[device] = (
-            current_stream, fwd_func,
-            bifwd_func, bwd_func, bibwd_func
-        )
-        return current_stream, fwd_func, bifwd_func, bwd_func, bibwd_func
-
-    def get_functions(self):
-        res = self._DEVICE2FUNC.get(torch.cuda.current_device(), None)
-        return res if res else self.compile_functions()
-
-    def forward(self, u, x, weight_c, bias, init=None, mask_c=None):
-        bidir = 2 if self.bidirectional else 1
+        bidir = 2 if ctx.bidirectional else 1
         length = x.size(0) if x.dim() == 3 else 1
         batch = x.size(-2)
-        d = self.d_out
-        mask_pad = self.mask_pad
+        d = ctx.d_out
+        mask_pad = ctx.mask_pad
         if mask_pad is not None:
             assert mask_pad.size(0) == length
             assert mask_pad.size(1) == batch
         k = u.size(-1) // d
-        k_ = k // 2 if self.bidirectional else k
-        skip_type = 0 if not self.has_skip_term else (1 if k_ == 3 else 2)
+        k_ = k // 2 if ctx.bidirectional else k
+        skip_type = 0 if not ctx.has_skip_term else (1 if k_ == 3 else 2)
         ncols = batch*d*bidir
         thread_per_block = min(512, ncols)
         num_block = (ncols-1) // thread_per_block + 1
@@ -506,15 +525,15 @@ class SRU_Compute_GPU(Function):
         c = x.new(*size)
         h = x.new(*size)
 
-        scale_x = self.scale_x
+        scale_x = ctx.scale_x
         if skip_type > 0 and k_ == 3:
             x_ptr = x.contiguous() * scale_x if scale_x is not None else x.contiguous()
             x_ptr = x_ptr.data_ptr()
         else:
             x_ptr = 0
 
-        stream, fwd_func, bifwd_func, _, _ = self.get_functions()
-        FUNC = fwd_func if not self.bidirectional else bifwd_func
+        stream, fwd_func, bifwd_func, _, _ = get_functions()
+        FUNC = fwd_func if not ctx.bidirectional else bifwd_func
         FUNC(args=[
             u.contiguous().data_ptr(),
             x_ptr,
@@ -529,35 +548,36 @@ class SRU_Compute_GPU(Function):
             k_,
             h.data_ptr(),
             c.data_ptr(),
-            self.activation_type,
+            ctx.activation_type,
             skip_type],
             block=(thread_per_block, 1, 1),
             grid=(num_block, 1, 1),
             stream=stream
         )
 
-        self.save_for_backward(u, x, weight_c, bias, init, mask_c)
-        self.intermediate = c
+        ctx.save_for_backward(u, x, weight_c, bias, init, mask_c)
+        ctx.intermediate = c
         if x.dim() == 2:
             last_hidden = c
-        elif self.bidirectional:
+        elif ctx.bidirectional:
             last_hidden = torch.cat((c[-1, :, :d], c[0, :, d:]), dim=1)
         else:
             last_hidden = c[-1]
         return h, last_hidden
 
-    def backward(self, grad_h, grad_last):
-        bidir = 2 if self.bidirectional else 1
-        u, x, weight_c, bias, init, mask_c = self.saved_tensors
-        c = self.intermediate
-        scale_x = self.scale_x
-        mask_pad = self.mask_pad
+    @staticmethod
+    def backward(ctx, grad_h, grad_last):
+        bidir = 2 if ctx.bidirectional else 1
+        u, x, weight_c, bias, init, mask_c = ctx.saved_tensors
+        c = ctx.intermediate
+        scale_x = ctx.scale_x
+        mask_pad = ctx.mask_pad
         length = x.size(0) if x.dim() == 3 else 1
         batch = x.size(-2)
-        d = self.d_out
+        d = ctx.d_out
         k = u.size(-1) // d
-        k_ = k // 2 if self.bidirectional else k
-        skip_type = 0 if not self.has_skip_term else (1 if k_ == 3 else 2)
+        k_ = k // 2 if ctx.bidirectional else k
+        skip_type = 0 if not ctx.has_skip_term else (1 if k_ == 3 else 2)
         ncols = batch*d*bidir
         thread_per_block = min(512, ncols)
         num_block = (ncols-1)//thread_per_block+1
@@ -575,8 +595,8 @@ class SRU_Compute_GPU(Function):
         else:
             x_ptr = 0
 
-        stream, _, _, bwd_func, bibwd_func = self.get_functions()
-        FUNC = bwd_func if not self.bidirectional else bibwd_func
+        stream, _, _, bwd_func, bibwd_func = get_functions()
+        FUNC = bwd_func if not ctx.bidirectional else bibwd_func
         FUNC(args=[
             u.contiguous().data_ptr(),
             x_ptr,
@@ -597,7 +617,7 @@ class SRU_Compute_GPU(Function):
             grad_wc.data_ptr(),
             grad_bias.data_ptr(),
             grad_init.data_ptr(),
-            self.activation_type,
+            ctx.activation_type,
             skip_type],
             block=(thread_per_block, 1, 1),
             grid=(num_block, 1, 1),
